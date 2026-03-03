@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../ComfyUI/custom_nodes/ComfyUI-WOFTSAM-PlanarTracker"
+		}
+	],
+	"settings": {}
+}
