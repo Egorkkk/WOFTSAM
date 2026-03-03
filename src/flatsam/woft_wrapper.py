@@ -1,8 +1,8 @@
 import numpy as np
 
 import flatsam.utils.vis as vu
-import flatsam.utils.geom as gu
-from flatsam.flatsam import sam_track, flatsam_track
+from flatsam.flatsam import flatsam_track
+from flatsam.mask_providers import build_mask_provider
 from flatsam.utils.timing import general_time_measurer
 from timeit import default_timer as timer
 
@@ -10,14 +10,24 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-def woft_track(sam_predictor, config, frames, init_coords, seq_name, debug=False, debug_fastforward=None):
+def woft_track(sam_predictor, config, frames, init_coords, seq_name, debug=False, debug_fastforward=None, external_masks=None):
     from flatsam.woft import WOFT
     tracker = WOFT(config)
 
     init_frame = frames[0].copy()
     init_mask = vu.draw_mask(init_coords, frames[0].shape[:2]).astype(np.uint8)
 
-    for frame_idx, mask in sam_track(frames, init_mask, sam_predictor, seq_name=seq_name):
+    mask_provider = build_mask_provider(
+        sam_predictor,
+        config,
+        frames,
+        init_mask,
+        seq_name=seq_name,
+        external_masks=external_masks,
+    )
+
+    for frame_idx in range(len(frames)):
+        mask = mask_provider.get_mask(frame_idx)
         if frame_idx == 0:
             tracker.init(init_frame, init_mask)
             H_cur2init = np.eye(3)
@@ -38,7 +48,7 @@ def woft_track(sam_predictor, config, frames, init_coords, seq_name, debug=False
 
         yield frame_idx, mask, vis, debug_info
 
-def woftsam_track(sam_predictor, config, frames, init_coords, seq_name, debug=False, debug_fastforward=None):
+def woftsam_track(sam_predictor, config, frames, init_coords, seq_name, debug=False, debug_fastforward=None, external_masks=None):
     from flatsam.woftsam import WOFTSAM
     tracker = WOFTSAM(config)
 
@@ -46,7 +56,16 @@ def woftsam_track(sam_predictor, config, frames, init_coords, seq_name, debug=Fa
     init_mask = vu.draw_mask(init_coords, frames[0].shape[:2]).astype(np.uint8)
 
     n_timed_frames = 0
-    for frame_idx, mask, vis, debug_info in flatsam_track(sam_predictor, config.flatsam, frames, init_coords, seq_name, debug, debug_fastforward):
+    for frame_idx, mask, vis, debug_info in flatsam_track(
+        sam_predictor,
+        config.flatsam,
+        frames,
+        init_coords,
+        seq_name,
+        debug,
+        debug_fastforward,
+        external_masks=external_masks,
+    ):
         if frame_idx == 0:
             tracker.init(init_frame, init_mask)
             H_cur2init = np.eye(3)

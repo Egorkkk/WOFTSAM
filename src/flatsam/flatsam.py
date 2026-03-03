@@ -2,7 +2,6 @@
 import sys
 from pathlib import Path
 import logging
-from timeit import default_timer as timer
 import math
 import itertools
 import pickle
@@ -10,7 +9,6 @@ import pickle
 import cv2
 import numpy as np
 import einops
-import torch
 from sam2.build_sam import build_sam2_video_predictor
 from scipy.signal import find_peaks
 from scipy.ndimage import distance_transform_edt
@@ -18,7 +16,7 @@ import scipy
 from skimage.feature import peak_local_max
 from skimage.metrics import structural_similarity
 
-from flatsam.utils.io import ram_directory_of_images
+from flatsam.mask_providers import build_mask_provider, Sam2MaskProvider
 import flatsam.utils.vis as vu
 from flatsam.utils.misc import remap, col_enumerate
 import numpy as np
@@ -65,7 +63,7 @@ def inflate(coords, amount):
     H = H_compose(H_to_origin, H_scale, np.linalg.inv(H_to_origin))
     return H_warp(H, coords)
 
-def flatsam_track(predictor, conf, frames, init_coords, seq_name, debug=False, debug_fastforward=None):
+def flatsam_track(predictor, conf, frames, init_coords, seq_name, debug=False, debug_fastforward=None, external_masks=None):
     sequence_timer = general_time_measurer('flatsam_sequence_tracking', cuda_sync=False, start_now=True)
     init_mask = vu.draw_mask(init_coords, frames[0].shape[:2])
     inflated_init_mask = vu.draw_mask(inflate(init_coords, 0.1), frames[0].shape[:2])
@@ -89,9 +87,19 @@ def flatsam_track(predictor, conf, frames, init_coords, seq_name, debug=False, d
     best_template_score = 0
     lost_at_least_once = False
 
+    mask_provider = build_mask_provider(
+        predictor,
+        conf,
+        frames,
+        init_mask,
+        seq_name=seq_name,
+        estimate_on_init_frame=sam_on_first_frame,
+        external_masks=external_masks,
+    )
+
     sam_timer.start()
-    for frame_idx, mask in sam_track(frames, init_mask, predictor, seq_name=seq_name,
-                                     estimate_on_init_frame=sam_on_first_frame):
+    for frame_idx in range(len(frames)):
+        mask = mask_provider.get_mask(frame_idx)
         sam_timer.stop()
 
         debug_info = {'frame_idx': frame_idx, 'debug_enabled': debug}
@@ -318,53 +326,16 @@ def sam_track(frames, init_mask, predictor, seq_name=None, estimate_on_init_fram
     args:
         estimate_on_init_frame: when True, repeat the initial frame and extract the SAM prediction there (instead of reusing exactly the init_mask)
     """
-    OBJ_ID = 1
-    start_time = timer()
-
-    with ram_directory_of_images(frames, seq_name, double_first_frame=estimate_on_init_frame) as video_path:
-        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-            state = predictor.init_state(str(video_path), offload_video_to_cpu=True, async_loading_frames=True)
-
-            # add new prompts and instantly get the output on the same frame
-            if bbox_init:
-                # x_min, y_min, x_max, y_max
-                init_bbox = gu.mask2bbox(init_mask).as_xyxy()
-                out_frame_idx, out_object_ids, out_mask_logits = predictor.add_new_points_or_box(state, frame_idx=0, obj_id=OBJ_ID, box=init_bbox)
-            else:
-                out_frame_idx, out_object_ids, out_mask_logits = predictor.add_new_mask(state, frame_idx=0, obj_id=OBJ_ID, mask=init_mask)
-
-            duration_s = timer() - start_time
-            logger.debug(f'SAM preparation: {duration_s}s')
-
-            start_time = timer()
-            n_timed_frames = 0
-            # propagate the prompts to get masklets throughout the video
-            last_frame_idx = -1
-            sam_timer = general_time_measurer('sam_inner_tracking', cuda_sync=False, start_now=False)
-            sam_timer.start()
-            for frame_idx, object_ids, mask_logits in predictor.propagate_in_video(state):
-                assert frame_idx == last_frame_idx + 1
-                last_frame_idx = frame_idx
-                n_timed_frames += 1
-                if estimate_on_init_frame and frame_idx == 0:
-                    continue
-                out_mask = np.zeros(frames[0].shape[:2], dtype=np.uint8) > 0
-                for oid, mask_logit in zip(object_ids, mask_logits):
-                    if oid == OBJ_ID:
-                        mask = (einops.rearrange(mask_logit, '1 H W -> H W') > 0).cpu().numpy()
-                        out_mask = np.logical_or(out_mask, mask)
-                sam_timer.report(reduction='mean')
-
-                with torch.amp.autocast('cuda', enabled=False):
-                    yield (frame_idx - 1 if estimate_on_init_frame else frame_idx,
-                           out_mask)
-                sam_timer.start()
-
-            duration_s = float(timer() - start_time)
-            ms_per_frame = (1000 * duration_s) / n_timed_frames
-            fps = n_timed_frames / duration_s
-
-            logger.debug(f'SAM tracking on {mask.shape[1]}x{mask.shape[0]} images: {ms_per_frame:.0f} ms/frame, {fps:0.1f} FPS')
+    provider = Sam2MaskProvider(
+        predictor,
+        frames,
+        init_mask,
+        seq_name=seq_name,
+        estimate_on_init_frame=estimate_on_init_frame,
+        bbox_init=bbox_init,
+    )
+    for frame_idx in range(len(frames)):
+        yield frame_idx, provider.get_mask(frame_idx)
 
 def approx_touching_edges(pts, shape, margin=0):
     return np.any((pts <= margin) | (pts >= [[shape[1] - 1 - margin], [shape[0] - 1 - margin]]),
