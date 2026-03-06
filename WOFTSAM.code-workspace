@@ -5,6 +5,9 @@
 		},
 		{
 			"path": "../ComfyUI/custom_nodes/ComfyUI-WOFTSAM-PlanarTracker"
+		},
+		{
+			"path": "../ComfyUI/custom_nodes/ComfyUI-PlanarTracker-QuadInit"
 		}
 	],
 	"settings": {}
